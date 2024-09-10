@@ -15,6 +15,13 @@ CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_BASE_URL = "https://api.spotify.com/v1"
 
+GENRES = [
+    "black metal", "brutal death metal", "deathcore", "folk metal", "folk rock",
+    "goregrind", "grindcore", "grunge", "hard rock", "heavy metal", "indie",
+    "industrial metal", "nu metal", "punk", "punk rock", "progressive metal",
+    "rap metal", "rap rock", "rock", "rock alternativo", "slamming", "thrash metal"
+]
+
 class Artist(rx.Base):
     name: str
     genres: List[str]
@@ -29,10 +36,9 @@ class State(rx.State):
     error_message: str = ""
     country_popularity: str = ""
     debug_info: str = ""
-    top_artists_honduras: List[Artist] = []  # Definir lista de Artist
-    selected_genres: List[str] = []
-    available_genres: List[str] = []
-    show_top_artists: bool = False
+    selected_genre: str = ""
+    genre_artists: List[Artist] = []
+    is_loading: bool = False
 
     def get_access_token(self) -> None:
         if not CLIENT_ID or not CLIENT_SECRET:
@@ -168,21 +174,28 @@ class State(rx.State):
 
         except requests.RequestException as e:
             self.error_message = f"Error obteniendo la popularidad por país: {str(e)}"
-            
-    def get_top_artists_honduras(self) -> None:
+
+    def select_genre(self, genre: str):
+        self.selected_genre = genre
+        self.get_artists_by_genre()
+
+    def get_artists_by_genre(self):
+        self.is_loading = True
         if not self.access_token:
             self.get_access_token()
         
         if self.error_message:
+            self.is_loading = False
             return
 
         headers = {"Authorization": f"Bearer {self.access_token}"}
         
-        params = {"country": "HN", "limit": 50}
         try:
-            response = requests.get(f"{SPOTIFY_API_BASE_URL}/browse/featured-playlists", headers=headers, params=params)
-            response.raise_for_status()
-            playlists = response.json()["playlists"]["items"]
+            # Buscar playlists relacionadas con el género
+            playlist_params = {"q": self.selected_genre, "type": "playlist", "market": "HN", "limit": 5}
+            playlist_response = requests.get(f"{SPOTIFY_API_BASE_URL}/search", headers=headers, params=playlist_params)
+            playlist_response.raise_for_status()
+            playlists = playlist_response.json()["playlists"]["items"]
 
             artist_count = {}
             for playlist in playlists:
@@ -201,41 +214,26 @@ class State(rx.State):
                                     "genres": []
                                 }
 
-            top_artists = sorted(artist_count.items(), key=lambda x: x[1]["count"], reverse=True)[:20]
-            for artist_id, artist_info in top_artists:
+            # Obtener detalles de los artistas y filtrar por género
+            genre_artists = []
+            for artist_id, artist_info in artist_count.items():
                 artist_response = requests.get(f"{SPOTIFY_API_BASE_URL}/artists/{artist_id}", headers=headers)
                 if artist_response.status_code == 200:
                     artist_details = artist_response.json()
-                    artist_info["genres"] = artist_details["genres"]
+                    if self.selected_genre.lower() in [g.lower() for g in artist_details["genres"]]:
+                        genre_artists.append(Artist(
+                            name=artist_info["name"],
+                            genres=artist_details["genres"],
+                            count=artist_info["count"]
+                        ))
 
-            self.top_artists_honduras = [Artist(name=info["name"], genres=info["genres"], count=info["count"]) for _, info in dict(top_artists).items()]
-            self.available_genres = list(set([genre for artist in self.top_artists_honduras for genre in artist.genres]))
+            # Ordenar y limitar a los top 10 artistas
+            self.genre_artists = sorted(genre_artists, key=lambda x: x.count, reverse=True)[:10]
 
         except requests.RequestException as e:
-            self.error_message = f"Error obteniendo los artistas top de Honduras: {str(e)}"
-            
-        self.show_top_artists = True
-
-    def toggle_genre(self, genre: str) -> None:
-        if genre in self.selected_genres:
-            self.selected_genres = [g for g in self.selected_genres if g != genre]
-        else:
-            self.selected_genres.append(genre)
-
-    def filter_top_artists(self) -> List[Artist]:
-        if not self.selected_genres:
-            return self.top_artists_honduras[:10]
-        return [
-            artist for artist in self.top_artists_honduras
-            if any(genre in artist.genres for genre in self.selected_genres)
-        ][:10]
+            self.error_message = f"Error obteniendo los artistas del género {self.selected_genre}: {str(e)}"
         
-    def handle_genre_toggle(self, genre: str) -> None:
-        if genre in self.selected_genres:
-            self.selected_genres = [g for g in self.selected_genres if g != genre]
-        else:
-            self.selected_genres.append(genre)
-
+        self.is_loading = False
 
 def index() -> rx.Component:
     return rx.vstack(
@@ -282,36 +280,46 @@ def index() -> rx.Component:
             rx.text(State.debug_info),
         ),
         rx.vstack(
-            rx.heading("Top Artistas en Honduras"),
-            rx.button("Cargar Top Artistas de Honduras", on_click=State.get_top_artists_honduras),
-            rx.text("Filtrar por géneros:"),
-            rx.hstack(
-                rx.foreach(
-                    State.available_genres,
-                    lambda genre: rx.checkbox(
-                        genre,
-                        on_change=State.toggle_genre(genre),  # Llamada directa a la función del State
-                        is_checked=State.selected_genres.contains(genre)
-                    )
-                )
+            rx.heading("Top Artistas en Honduras por Género"),
+            rx.text("Selecciona un género para ver los artistas:"),
+            rx.form.root(
+                rx.vstack(
+                    rx.select(
+                        GENRES,
+                        placeholder="Selecciona un género",
+                        on_change=State.select_genre,
+                        name="genre",
+                    ),
+                    width="100%",
+                ),
+                width="100%",
             ),
             rx.cond(
-                State.show_top_artists,
-                rx.vstack(
-                    rx.text("Top 10 Artistas en Honduras:"),
+                State.is_loading,
+                rx.spinner(),
+                rx.cond(
+                    State.genre_artists.length() > 0,
                     rx.vstack(
-                        rx.foreach(
-                            State.top_artists_honduras,
-                            lambda artist: rx.hstack(
-                                rx.text(artist.name),
-                                rx.text(f"Géneros: {', '.join(artist.genres) if isinstance(artist.genres, list) else 'No disponible'}"),
-                                rx.spacer(),
-                                rx.text(f"Apariciones: {artist.count}")
+                        rx.heading(f"Top Artistas en el género {State.selected_genre}", size="md"),
+                        rx.vstack(
+                            rx.foreach(
+                                State.genre_artists,
+                                lambda artist: rx.hstack(
+                                    rx.text(artist.name),
+                                    rx.spacer(),
+                                    rx.text(f"Apariciones: {artist.count}")
+                                )
                             )
-                        )
-                    )
+                        ),
+                        padding="1em",
+                        border="1px solid #ccc",
+                        border_radius="md",
+                        margin="1em 0"
+                    ),
+                    rx.text("No se encontraron artistas para este género.")
                 )
-            )
+            ),
+            rx.text(State.error_message, color="red"),
         ),
         spacing="1em",
     )
