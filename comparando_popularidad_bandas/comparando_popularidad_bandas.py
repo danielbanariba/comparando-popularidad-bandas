@@ -15,6 +15,11 @@ CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_BASE_URL = "https://api.spotify.com/v1"
 
+class Artist(rx.Base):
+    name: str
+    genres: List[str]
+    count: int
+
 class State(rx.State):
     access_token: str = ""
     search_query: str = ""
@@ -24,6 +29,10 @@ class State(rx.State):
     error_message: str = ""
     country_popularity: str = ""
     debug_info: str = ""
+    top_artists_honduras: List[Artist] = []  # Definir lista de Artist
+    selected_genres: List[str] = []
+    available_genres: List[str] = []
+    show_top_artists: bool = False
 
     def get_access_token(self) -> None:
         if not CLIENT_ID or not CLIENT_SECRET:
@@ -51,7 +60,7 @@ class State(rx.State):
             return
 
         headers = {"Authorization": f"Bearer {self.access_token}"}
-        params = {"q": self.search_query, "type": "artist", "limit": 3}  # Cambiado de 10 a 3
+        params = {"q": self.search_query, "type": "artist", "limit": 3}
         try:
             response = requests.get(f"{SPOTIFY_API_BASE_URL}/search", headers=headers, params=params)
             response.raise_for_status()
@@ -65,7 +74,6 @@ class State(rx.State):
                     "popularity": artist["popularity"],
                     "followers": artist["followers"]["total"],
                 }
-                # Obtener información detallada del artista para conseguir el país
                 artist_response = requests.get(f"{SPOTIFY_API_BASE_URL}/artists/{artist['id']}", headers=headers)
                 if artist_response.status_code == 200:
                     artist_details = artist_response.json()
@@ -160,50 +168,152 @@ class State(rx.State):
 
         except requests.RequestException as e:
             self.error_message = f"Error obteniendo la popularidad por país: {str(e)}"
+            
+    def get_top_artists_honduras(self) -> None:
+        if not self.access_token:
+            self.get_access_token()
+        
+        if self.error_message:
+            return
+
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        
+        params = {"country": "HN", "limit": 50}
+        try:
+            response = requests.get(f"{SPOTIFY_API_BASE_URL}/browse/featured-playlists", headers=headers, params=params)
+            response.raise_for_status()
+            playlists = response.json()["playlists"]["items"]
+
+            artist_count = {}
+            for playlist in playlists:
+                tracks_response = requests.get(f"{SPOTIFY_API_BASE_URL}/playlists/{playlist['id']}/tracks", headers=headers)
+                if tracks_response.status_code == 200:
+                    tracks = tracks_response.json()["items"]
+                    for track in tracks:
+                        if track["track"] and track["track"]["artists"]:
+                            artist = track["track"]["artists"][0]
+                            if artist["id"] in artist_count:
+                                artist_count[artist["id"]]["count"] += 1
+                            else:
+                                artist_count[artist["id"]] = {
+                                    "name": artist["name"],
+                                    "count": 1,
+                                    "genres": []
+                                }
+
+            top_artists = sorted(artist_count.items(), key=lambda x: x[1]["count"], reverse=True)[:20]
+            for artist_id, artist_info in top_artists:
+                artist_response = requests.get(f"{SPOTIFY_API_BASE_URL}/artists/{artist_id}", headers=headers)
+                if artist_response.status_code == 200:
+                    artist_details = artist_response.json()
+                    artist_info["genres"] = artist_details["genres"]
+
+            self.top_artists_honduras = [Artist(name=info["name"], genres=info["genres"], count=info["count"]) for _, info in dict(top_artists).items()]
+            self.available_genres = list(set([genre for artist in self.top_artists_honduras for genre in artist.genres]))
+
+        except requests.RequestException as e:
+            self.error_message = f"Error obteniendo los artistas top de Honduras: {str(e)}"
+            
+        self.show_top_artists = True
+
+    def toggle_genre(self, genre: str) -> None:
+        if genre in self.selected_genres:
+            self.selected_genres = [g for g in self.selected_genres if g != genre]
+        else:
+            self.selected_genres.append(genre)
+
+    def filter_top_artists(self) -> List[Artist]:
+        if not self.selected_genres:
+            return self.top_artists_honduras[:10]
+        return [
+            artist for artist in self.top_artists_honduras
+            if any(genre in artist.genres for genre in self.selected_genres)
+        ][:10]
+        
+    def handle_genre_toggle(self, genre: str) -> None:
+        if genre in self.selected_genres:
+            self.selected_genres = [g for g in self.selected_genres if g != genre]
+        else:
+            self.selected_genres.append(genre)
+
 
 def index() -> rx.Component:
     return rx.vstack(
         rx.heading("Comparación de Popularidad en Spotify"),
-        rx.hstack(
-            rx.input(placeholder="Buscar artista", on_change=State.set_search_query),
-            rx.button("Buscar", on_click=State.search_artists),
+        rx.vstack(
+            rx.hstack(
+                rx.input(placeholder="Buscar artista", on_change=State.set_search_query),
+                rx.button("Buscar", on_click=State.search_artists),
+            ),
+            rx.vstack(
+                rx.foreach(
+                    State.search_results,
+                    lambda artist: rx.vstack(
+                        rx.text(f"{artist['name']} - País: {artist['country']}"),
+                        rx.text(f"Géneros: {artist['genres']}"),
+                        rx.text(f"Popularidad global: {artist['popularity']} - Seguidores: {artist['followers']}"),
+                        rx.hstack(
+                            rx.button(
+                                "Seleccionar para comparación",
+                                on_click=lambda: State.select_artist(artist),
+                                is_disabled=State.selected_artists.length() >= 2
+                            ),
+                            rx.button(
+                                "Popularidad en Honduras",
+                                on_click=lambda: State.get_country_popularity(artist),
+                            )
+                        ),
+                        rx.divider()
+                    )
+                )
+            ),
+            rx.text("Artistas seleccionados:"),
+            rx.vstack(
+                rx.foreach(
+                    State.selected_artists,
+                    lambda artist: rx.text(f"{artist['name']} ({artist['country']})")
+                )
+            ),
+            rx.button("Comparar", on_click=State.compare_popularity, is_disabled=State.selected_artists.length() != 2),
+            rx.button("Reiniciar", on_click=State.reset_comparison),
+            rx.text(State.comparison_result),
+            rx.text(State.country_popularity),
+            rx.text(State.error_message, color="red"),
+            rx.text(State.debug_info),
         ),
         rx.vstack(
-            rx.foreach(
-                State.search_results,
-                lambda artist: rx.vstack(
-                    rx.text(f"{artist['name']} - País: {artist['country']}"),
-                    rx.text(f"Géneros: {artist['genres']}"),
-                    rx.text(f"Popularidad global: {artist['popularity']} - Seguidores: {artist['followers']}"),
-                    rx.hstack(
-                        rx.button(
-                            "Seleccionar para comparación",
-                            on_click=lambda: State.select_artist(artist),
-                            is_disabled=State.selected_artists.length() >= 2
-                        ),
-                        rx.button(
-                            "Popularidad en Honduras",
-                            on_click=lambda: State.get_country_popularity(artist),
+            rx.heading("Top Artistas en Honduras"),
+            rx.button("Cargar Top Artistas de Honduras", on_click=State.get_top_artists_honduras),
+            rx.text("Filtrar por géneros:"),
+            rx.hstack(
+                rx.foreach(
+                    State.available_genres,
+                    lambda genre: rx.checkbox(
+                        genre,
+                        on_change=State.toggle_genre(genre),  # Llamada directa a la función del State
+                        is_checked=State.selected_genres.contains(genre)
+                    )
+                )
+            ),
+            rx.cond(
+                State.show_top_artists,
+                rx.vstack(
+                    rx.text("Top 10 Artistas en Honduras:"),
+                    rx.vstack(
+                        rx.foreach(
+                            State.top_artists_honduras,
+                            lambda artist: rx.hstack(
+                                rx.text(artist.name),
+                                rx.text(f"Géneros: {', '.join(artist.genres) if isinstance(artist.genres, list) else 'No disponible'}"),
+                                rx.spacer(),
+                                rx.text(f"Apariciones: {artist.count}")
+                            )
                         )
-                    ),
-                    rx.divider()
+                    )
                 )
             )
         ),
-        rx.text("Artistas seleccionados:"),
-        rx.vstack(
-            rx.foreach(
-                State.selected_artists,
-                lambda artist: rx.text(f"{artist['name']} ({artist['country']})")
-            )
-        ),
-        rx.button("Comparar", on_click=State.compare_popularity, is_disabled=State.selected_artists.length() != 2),
-        rx.button("Reiniciar", on_click=State.reset_comparison),
-        rx.text(State.comparison_result),
-        rx.text(State.country_popularity),
-        rx.text(State.error_message, color="red"),
-        rx.text(State.debug_info),
-        spacing="1em"
+        spacing="1em",
     )
 
 app = rx.App()
